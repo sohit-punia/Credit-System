@@ -1,0 +1,63 @@
+# Node.js dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs
+*.log
+logs/**/*.log
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Build / dist output
+dist/
+build/
+coverage/
+.cache/
+.temp/
+
+# VS Code settings
+.vscode/
+.history/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Uploads (if storing locally)
+uploads/
+tmp/
+uploads/**/*
+temp/**/*
+__pycache__/
+
+# MongoDB local data (if ever dumped)
+dump/
+data/
+
+# Test files / coverage
+coverage/
+*.lcov
+
+# Ignore any generated seed or backup files
+seed/*.json
+backup/
+*.bak
+*.zip
+*.tar.gz
+*.tgz
+
+# Optional: lock files (if using multiple package managers)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
