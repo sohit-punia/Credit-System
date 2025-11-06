@@ -1,4 +1,3 @@
-// backend/src/routes/credits.js
 const express = require('express');
 const mongoose = require('mongoose');
 const router = express.Router();
@@ -7,13 +6,10 @@ const CreditTransaction = require('../models/CreditTransaction');
 const User = require('../models/User');
 const auth = require('../middleware/auth');
 
-// Use dev auth middleware (expects x-user-id header)
+// dev auth
 router.use(auth);
 
-/**
- * GET /api/credits
- * Returns current cached balance for the authenticated user
- */
+// GET /api/credits
 router.get('/', async (req, res) => {
   try {
     const user = await User.findById(req.user._id);
@@ -25,11 +21,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-/**
- * POST /api/credits/grant
- * Grant credits to any user (dev/admin helper).
- * Body: { userId, amount, type = 'grant', idempotencyKey? }
- */
+// POST /api/credits/grant
 router.post('/grant', async (req, res) => {
   const { userId, amount, type = 'grant', idempotencyKey } = req.body;
   if (!userId || typeof amount !== 'number') {
@@ -40,13 +32,11 @@ router.post('/grant', async (req, res) => {
   try {
     session.startTransaction();
 
-    // Insert transaction (idempotent if idempotencyKey provided)
     const txDocs = await CreditTransaction.create(
       [{ userId, amount, type, idempotencyKey }],
       { session }
     );
 
-    // Update user's cached balance
     await User.updateOne({ _id: userId }, { $inc: { creditsBalance: amount } }).session(session);
 
     await session.commitTransaction();
@@ -56,22 +46,13 @@ router.post('/grant', async (req, res) => {
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
-
-    // Duplicate idempotency key (unique index) — treat as success (idempotent)
-    if (err && err.code === 11000) {
-      return res.status(200).json({ success: true, message: 'duplicate_idempotency' });
-    }
-
+    if (err && err.code === 11000) return res.status(200).json({ success: true, message: 'duplicate_idempotency' });
     console.error(err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * POST /api/credits/consume
- * Fast synchronous consume endpoint for quick operations.
- * Body: { cost, toolId, breakdown, pluginRequestId, idempotencyKey }
- */
+// POST /api/credits/consume
 router.post('/consume', async (req, res) => {
   const { cost, toolId, breakdown = {}, pluginRequestId, idempotencyKey } = req.body;
 
@@ -84,7 +65,6 @@ router.post('/consume', async (req, res) => {
   try {
     session.startTransaction();
 
-    // If this idempotency key was already processed, return existing tx result
     const existing = await CreditTransaction.findOne({ userId, idempotencyKey }).session(session);
     if (existing) {
       const userNow = await User.findById(userId).session(session);
@@ -93,22 +73,15 @@ router.post('/consume', async (req, res) => {
       return res.json({ success: true, newBalance: userNow.creditsBalance, txId: existing._id });
     }
 
-    // Load fresh user inside the transaction
     const user = await User.findById(userId).session(session);
     if (!user) throw new Error('User not found');
 
-    // Check sufficient balance
     if ((user.creditsBalance || 0) < cost) {
       await session.abortTransaction();
       session.endSession();
-      return res.status(402).json({
-        success: false,
-        code: 'INSUFFICIENT_FUNDS',
-        needed: cost - (user.creditsBalance || 0)
-      });
+      return res.status(402).json({ success: false, code: 'INSUFFICIENT_FUNDS', needed: cost - (user.creditsBalance || 0) });
     }
 
-    // Create consume transaction and decrement cached balance atomically
     const txDocs = await CreditTransaction.create(
       [{
         userId,
@@ -128,17 +101,12 @@ router.post('/consume', async (req, res) => {
 
     return res.json({ success: true, newBalance: user.creditsBalance, txId: txDocs[0]._id });
   } catch (err) {
-    // Ensure session is cleaned up even on errors
-    try { await session.abortTransaction(); } catch (e) {}
-    try { session.endSession(); } catch (e) {}
-
-    // Duplicate key error could occur if another request created tx with same idempotencyKey concurrently
+    try { await session.abortTransaction(); } catch(e) {}
+    try { session.endSession(); } catch(e) {}
     if (err && err.code === 11000) {
-      // Return the current cached balance as success
       const userNow = await User.findById(userId);
       return res.json({ success: true, newBalance: userNow.creditsBalance });
     }
-
     console.error(err);
     return res.status(500).json({ success: false, error: err.message });
   }
