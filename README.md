@@ -52,7 +52,7 @@ Below is a clear, simplified architecture showing how the Figma plugin communica
 
 ---
 
-## 📁 Project Folder Structure
+##🧾 Route Summary Table
 
 
 
