@@ -52,9 +52,7 @@ Below is a clear, simplified architecture showing how the Figma plugin communica
 
 ---
 
-# 📁 Project Folder Structure
-
-
+## 📁 Project Folder Structure
 
 backend/
 │
@@ -76,8 +74,8 @@ backend/
 │ │ ├── usage.js
 │ │ └── pricing.js
 │ │
-│ ├── utils/
-│ │ └── logger.js # Logging helper
+│ ├── utils/ # Logging helpers, tools
+│ │ └── logger.js
 │ │
 │ └── index.js # App entrypoint
 │
@@ -85,10 +83,14 @@ backend/
 │ └── seed.js # Seed pricing + test user
 │
 ├── plugin/
-│ └── usageManager.js # Frontend plugin logic
+│ └── usageManager.js # Frontend plugin usage manager
 │
 ├── .env # Environment variables
 └── package.json
+
+yaml
+Copy code
+
 
 
 | Method | Route                | Description            |
