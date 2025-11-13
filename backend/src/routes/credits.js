@@ -9,6 +9,13 @@ const auth = require('../middleware/auth');
 // dev auth
 router.use(auth);
 
+// Helper: build tx doc but DO NOT attach idempotencyKey if falsy
+const makeTxDoc = ({ userId, amount, type, meta = {}, idempotencyKey }) => {
+  const doc = { userId, amount, type, meta };
+  if (idempotencyKey) doc.idempotencyKey = idempotencyKey;
+  return doc;
+};
+
 // GET /api/credits
 router.get('/', async (req, res) => {
   try {
@@ -33,7 +40,7 @@ router.post('/grant', async (req, res) => {
     session.startTransaction();
 
     const txDocs = await CreditTransaction.create(
-      [{ userId, amount, type, idempotencyKey }],
+      [makeTxDoc({ userId, amount, type, idempotencyKey })],
       { session }
     );
 
@@ -44,71 +51,74 @@ router.post('/grant', async (req, res) => {
 
     return res.json({ success: true, txId: txDocs[0]._id });
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
+    try { await session.abortTransaction(); } catch(e) {}
+    try { session.endSession(); } catch(e) {}
+
+    // idempotency duplicate -> treat as success
     if (err && err.code === 11000) return res.status(200).json({ success: true, message: 'duplicate_idempotency' });
+
     console.error(err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/credits/consume
+// POST /api/credits/consume (fast synchronous consume)
+// Non-transactional, atomic consume (fallback for local dev)
 router.post('/consume', async (req, res) => {
   const { cost, toolId, breakdown = {}, pluginRequestId, idempotencyKey } = req.body;
-
   if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
   if (!Number.isInteger(cost) || cost <= 0) return res.status(400).json({ error: 'invalid cost' });
 
   const userId = req.user._id;
-  const session = await mongoose.startSession();
 
   try {
-    session.startTransaction();
-
-    const existing = await CreditTransaction.findOne({ userId, idempotencyKey }).session(session);
+    // idempotency check first
+    const existing = await CreditTransaction.findOne({ userId, idempotencyKey });
     if (existing) {
-      const userNow = await User.findById(userId).session(session);
-      await session.commitTransaction();
-      session.endSession();
+      const userNow = await User.findById(userId);
       return res.json({ success: true, newBalance: userNow.creditsBalance, txId: existing._id });
     }
 
-    const user = await User.findById(userId).session(session);
-    if (!user) throw new Error('User not found');
-
-    if ((user.creditsBalance || 0) < cost) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(402).json({ success: false, code: 'INSUFFICIENT_FUNDS', needed: cost - (user.creditsBalance || 0) });
-    }
-
-    const txDocs = await CreditTransaction.create(
-      [{
-        userId,
-        amount: -cost,
-        type: 'consume',
-        meta: { toolId, breakdown, pluginRequestId },
-        idempotencyKey
-      }],
-      { session }
+    // Atomic find-and-update to ensure no overdraft (single call)
+    const updatedUser = await User.findOneAndUpdate(
+      { _id: userId, creditsBalance: { $gte: cost } },
+      { $inc: { creditsBalance: -cost } },
+      { new: true }
     );
 
-    user.creditsBalance = user.creditsBalance - cost;
-    await user.save({ session });
+    if (!updatedUser) {
+      // not enough balance
+      const current = await User.findById(userId);
+      const deficit = cost - (current ? current.creditsBalance : 0);
+      return res.status(402).json({ success: false, code: 'INSUFFICIENT_FUNDS', needed: deficit });
+    }
 
-    await session.commitTransaction();
-    session.endSession();
+    // create transaction record (no session)
+    const txDoc = { userId, amount: -cost, type: 'consume', meta: { toolId, breakdown, pluginRequestId } };
+    if (idempotencyKey) txDoc.idempotencyKey = idempotencyKey;
+    const tx = await CreditTransaction.create(txDoc);
 
-    return res.json({ success: true, newBalance: user.creditsBalance, txId: txDocs[0]._id });
+    return res.json({ success: true, newBalance: updatedUser.creditsBalance, txId: tx._id });
   } catch (err) {
-    try { await session.abortTransaction(); } catch(e) {}
-    try { session.endSession(); } catch(e) {}
+    // handle duplicate idempotency race
     if (err && err.code === 11000) {
       const userNow = await User.findById(userId);
       return res.json({ success: true, newBalance: userNow.creditsBalance });
     }
-    console.error(err);
+    console.error('consume error', err);
     return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/credits/history
+router.get('/history', async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const txs = await CreditTransaction.find({ userId }).sort({ createdAt: -1 }).limit(500);
+    return res.json({ transactions: txs });
+  } catch (err) {
+    console.error('history error', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 

@@ -8,186 +8,198 @@ const auth = require('../middleware/auth');
 
 router.use(auth);
 
-// POST /api/usage/start
+// Helper to avoid attaching idempotencyKey when falsy
+const makeTxDoc = ({ userId, amount, type, meta = {}, idempotencyKey }) => {
+  const doc = { userId, amount, type, meta };
+  if (idempotencyKey) doc.idempotencyKey = idempotencyKey;
+  return doc;
+};
+
+/**
+ * POST /api/usage/start
+ * - For local fallback: will check idempotency, ensure balance >= estimate (if hold),
+ *   create a UsageLog and create a hold transaction (atomic flow: decrement user then write tx).
+ */
 router.post('/start', async (req, res) => {
   const { toolId, estimate = 0, meta = {}, pluginRequestId, idempotencyKey, hold = true } = req.body;
   if (!pluginRequestId) return res.status(400).json({ error: 'pluginRequestId required' });
 
   const userId = req.user._id;
-  const session = await mongoose.startSession();
+
   try {
-    session.startTransaction();
-
-    const existing = await UsageLog.findOne({ userId, idempotencyKey }).session(session);
-    if (existing) {
-      await session.commitTransaction();
-      session.endSession();
-      return res.json({ ok: true, usage: existing });
+    // idempotency check: if key provided
+    if (idempotencyKey) {
+      const existing = await UsageLog.findOne({ userId, idempotencyKey });
+      if (existing) return res.json({ ok: true, usage: existing });
     }
 
-    const user = await User.findById(userId).session(session);
-    if (!user) throw new Error('User not found');
-
-    if (hold && user.creditsBalance < estimate) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(402).json({ ok: false, code: 'INSUFFICIENT_FUNDS', needed: estimate - user.creditsBalance });
-    }
-
+    // If hold required and estimate > 0, atomically decrement user balance
     let holdTx = null;
     if (hold && estimate > 0) {
-      const txs = await CreditTransaction.create(
-        [{ userId, amount: -estimate, type: 'hold', meta: { toolId, pluginRequestId }, idempotencyKey }],
-        { session }
+      // Atomically decrement balance only if enough funds
+      const updatedUser = await User.findOneAndUpdate(
+        { _id: userId, creditsBalance: { $gte: estimate } },
+        { $inc: { creditsBalance: -estimate } },
+        { new: true }
       );
-      holdTx = txs[0];
-      user.creditsBalance -= estimate;
-      await user.save({ session });
+      if (!updatedUser) {
+        const current = await User.findById(userId);
+        const deficit = estimate - (current ? current.creditsBalance : 0);
+        return res.status(402).json({ ok: false, code: 'INSUFFICIENT_FUNDS', needed: deficit });
+      }
+
+      // Create hold transaction record
+      const txDoc = makeTxDoc({ userId, amount: -estimate, type: 'hold', meta: { toolId, pluginRequestId }, idempotencyKey });
+      holdTx = await CreditTransaction.create(txDoc);
     }
 
-    const usage = await UsageLog.create(
-      [{
-        userId,
-        pluginRequestId,
-        idempotencyKey,
-        toolId,
-        status: 'started',
-        estimate,
-        meta,
-        holdTxId: holdTx ? holdTx._id : null,
-        startedAt: new Date()
-      }],
-      { session }
-    );
+    // Create usage log (no session)
+    const usage = await UsageLog.create({
+      userId,
+      pluginRequestId,
+      idempotencyKey: idempotencyKey || undefined,
+      toolId,
+      status: 'started',
+      estimate,
+      meta,
+      holdTxId: holdTx ? holdTx._id : null,
+      startedAt: new Date()
+    });
 
-    await session.commitTransaction();
-    session.endSession();
-    return res.json({ ok: true, usage: usage[0], newBalance: user.creditsBalance });
+    // If we didn't do an atomic decrement, fetch current balance to return
+    const userNow = await User.findById(userId);
+    return res.json({ ok: true, usage, newBalance: userNow.creditsBalance });
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-    console.error(err);
+    // If duplicate key on tx or usage (11000) treat as idempotent success
+    if (err && err.code === 11000) {
+      const userNow = await User.findById(userId);
+      return res.json({ ok: true, newBalance: userNow.creditsBalance, note: 'duplicate_ignored' });
+    }
+    console.error('usage/start error', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// POST /api/usage/finalize
+/**
+ * POST /api/usage/finalize
+ * - For local fallback: fetch usage, compute differences, update user via atomic ops
+ *   (refund or extra consume), write transactions, and update usage doc.
+ */
 router.post('/finalize', async (req, res) => {
   const { pluginRequestId, idempotencyKey, actualCost = 0, meta = {} } = req.body;
   if (!pluginRequestId) return res.status(400).json({ error: 'pluginRequestId required' });
 
   const userId = req.user._id;
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
+    // find usage (prefer idempotencyKey if provided)
+    const usage = idempotencyKey
+      ? await UsageLog.findOne({ userId, idempotencyKey, pluginRequestId })
+      : await UsageLog.findOne({ userId, pluginRequestId });
 
-    const usage = await UsageLog.findOne({ userId, idempotencyKey, pluginRequestId }).session(session);
-    if (!usage) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({ ok: false, error: 'usage_not_found' });
-    }
+    if (!usage) return res.status(404).json({ ok: false, error: 'usage_not_found' });
     if (usage.status === 'completed') {
-      await session.commitTransaction();
-      session.endSession();
       const userNow = await User.findById(userId);
       return res.json({ ok: true, newBalance: userNow.creditsBalance });
     }
 
-    const user = await User.findById(userId).session(session);
-    if (!user) throw new Error('User not found');
-
+    // If a hold existed: held amount = abs(holdTx.amount)
     if (usage.holdTxId) {
-      const holdTx = await CreditTransaction.findById(usage.holdTxId).session(session);
+      const holdTx = await CreditTransaction.findById(usage.holdTxId);
+      if (!holdTx) throw new Error('holdTx not found');
+
       const heldAmount = Math.abs(holdTx.amount);
       const diff = actualCost - heldAmount;
 
+      // Case: actualCost > heldAmount => need additional funds
       if (diff > 0) {
-        if ((user.creditsBalance || 0) < diff) {
-          await session.abortTransaction();
-          session.endSession();
-          return res.status(402).json({ ok: false, code: 'INSUFFICIENT_FUNDS', needed: diff - (user.creditsBalance || 0) });
+        // Atomically remove additional funds if available
+        const updatedUser = await User.findOneAndUpdate(
+          { _id: userId, creditsBalance: { $gte: diff } },
+          { $inc: { creditsBalance: -diff } },
+          { new: true }
+        );
+        if (!updatedUser) {
+          const current = await User.findById(userId);
+          return res.status(402).json({ ok: false, code: 'INSUFFICIENT_FUNDS', needed: diff - (current ? current.creditsBalance : 0) });
         }
-        await CreditTransaction.create([{ userId, amount: -diff, type: 'consume', meta: { pluginRequestId, usageId: usage._id } }], { session });
-        user.creditsBalance -= diff;
+        // create extra consume tx
+        await CreditTransaction.create(makeTxDoc({ userId, amount: -diff, type: 'consume', meta: { pluginRequestId, usageId: usage._id } }));
       } else if (diff < 0) {
+        // refund: increase user balance by (-diff)
         const refund = -diff;
-        await CreditTransaction.create([{ userId, amount: refund, type: 'refund', meta: { pluginRequestId, usageId: usage._id } }], { session });
-        user.creditsBalance += refund;
+        await User.findByIdAndUpdate(userId, { $inc: { creditsBalance: refund } });
+        await CreditTransaction.create(makeTxDoc({ userId, amount: refund, type: 'refund', meta: { pluginRequestId, usageId: usage._id } }));
       }
 
-      await CreditTransaction.create([{ userId, amount: -actualCost, type: 'consume', meta: { pluginRequestId, usageId: usage._id } }], { session });
+      // create final consume record for bookkeeping (amount = -actualCost)
+      await CreditTransaction.create(makeTxDoc({ userId, amount: -actualCost, type: 'consume', meta: { pluginRequestId, usageId: usage._id } }));
+
     } else {
-      if ((user.creditsBalance || 0) < actualCost) {
-        await session.abortTransaction();
-        session.endSession();
-        return res.status(402).json({ ok: false, code: 'INSUFFICIENT_FUNDS', needed: actualCost - (user.creditsBalance || 0) });
+      // No hold: directly atomically deduct actualCost
+      const updatedUser = await User.findOneAndUpdate(
+        { _id: userId, creditsBalance: { $gte: actualCost } },
+        { $inc: { creditsBalance: -actualCost } },
+        { new: true }
+      );
+      if (!updatedUser) {
+        const current = await User.findById(userId);
+        return res.status(402).json({ ok: false, code: 'INSUFFICIENT_FUNDS', needed: actualCost - (current ? current.creditsBalance : 0) });
       }
-      await CreditTransaction.create([{ userId, amount: -actualCost, type: 'consume', meta: { pluginRequestId, usageId: usage._id } }], { session });
-      user.creditsBalance -= actualCost;
+      await CreditTransaction.create(makeTxDoc({ userId, amount: -actualCost, type: 'consume', meta: { pluginRequestId, usageId: usage._id } }));
     }
 
+    // finalize usage log
     usage.actualCost = actualCost;
     usage.status = 'completed';
     usage.completedAt = new Date();
     usage.meta = { ...usage.meta, ...meta };
-    await usage.save({ session });
-    await user.save({ session });
+    await usage.save();
 
-    await session.commitTransaction();
-    session.endSession();
-    return res.json({ ok: true, newBalance: user.creditsBalance });
+    const userNow = await User.findById(userId);
+    return res.json({ ok: true, newBalance: userNow.creditsBalance });
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-    console.error(err);
+    if (err && err.code === 11000) {
+      const userNow = await User.findById(userId);
+      return res.json({ ok: true, newBalance: userNow.creditsBalance, note: 'duplicate_ignored' });
+    }
+    console.error('usage/finalize error', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// POST /api/usage/cancel
+/**
+ * POST /api/usage/cancel
+ * - If usage had a hold, refund the held amount and mark usage cancelled.
+ */
 router.post('/cancel', async (req, res) => {
   const { pluginRequestId, idempotencyKey, reason } = req.body;
   if (!pluginRequestId) return res.status(400).json({ error: 'pluginRequestId required' });
 
   const userId = req.user._id;
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
+    const usage = idempotencyKey
+      ? await UsageLog.findOne({ userId, idempotencyKey, pluginRequestId })
+      : await UsageLog.findOne({ userId, pluginRequestId });
 
-    const usage = await UsageLog.findOne({ userId, idempotencyKey, pluginRequestId }).session(session);
-    if (!usage) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({ ok: false, error: 'usage_not_found' });
-    }
-
-    if (usage.status === 'completed') {
-      await session.commitTransaction();
-      session.endSession();
-      return res.json({ ok: true });
-    }
+    if (!usage) return res.status(404).json({ ok: false, error: 'usage_not_found' });
+    if (usage.status === 'completed') return res.json({ ok: true });
 
     if (usage.holdTxId) {
-      const holdTx = await CreditTransaction.findById(usage.holdTxId).session(session);
-      const refund = Math.abs(holdTx.amount);
-      await CreditTransaction.create([{ userId, amount: refund, type: 'release', meta: { pluginRequestId, reason } }], { session });
-      const user = await User.findById(userId).session(session);
-      user.creditsBalance += refund;
-      await user.save({ session });
+      const holdTx = await CreditTransaction.findById(usage.holdTxId);
+      if (holdTx) {
+        const refund = Math.abs(holdTx.amount);
+        await User.findByIdAndUpdate(userId, { $inc: { creditsBalance: refund } });
+        await CreditTransaction.create(makeTxDoc({ userId, amount: refund, type: 'release', meta: { pluginRequestId, reason } }));
+      }
     }
 
     usage.status = 'cancelled';
     usage.meta = { ...usage.meta, cancelledReason: reason };
-    await usage.save({ session });
+    await usage.save();
 
-    await session.commitTransaction();
-    session.endSession();
     return res.json({ ok: true });
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-    console.error(err);
+    console.error('usage/cancel error', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
