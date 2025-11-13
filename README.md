@@ -54,42 +54,7 @@ Below is a clear, simplified architecture showing how the Figma plugin communica
 
 ## 📁 Project Folder Structure
 
-backend/
-│
-├── src/
-│ ├── config/ # DB connection
-│ │ └── db.js
-│ │
-│ ├── middleware/ # Dev auth middleware
-│ │ └── auth.js
-│ │
-│ ├── models/ # MongoDB schemas
-│ │ ├── User.js
-│ │ ├── CreditTransaction.js
-│ │ ├── UsageLog.js
-│ │ └── ToolPricing.js
-│ │
-│ ├── routes/ # API routes
-│ │ ├── credits.js
-│ │ ├── usage.js
-│ │ └── pricing.js
-│ │
-│ ├── utils/ # Logging helpers, tools
-│ │ └── logger.js
-│ │
-│ └── index.js # App entrypoint
-│
-├── scripts/
-│ └── seed.js # Seed pricing + test user
-│
-├── plugin/
-│ └── usageManager.js # Frontend plugin usage manager
-│
-├── .env # Environment variables
-└── package.json
 
-yaml
-Copy code
 
 
 
